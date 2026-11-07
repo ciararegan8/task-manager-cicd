@@ -1,0 +1,27 @@
+
+name: CI Workflow - Docker
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      # Step 1: Checks out the repository code.
+
+      - name: Build Docker image
+        run: docker build -t task-manager:latest .
+
+      # Step 2: Builds the Docker image.
+
+      - name: Run Docker container
+        run: docker run --rm -e GITHUB_USER="${{ github.actor }}" task-manager:latest
+
+      # Step 3: Runs the Docker container.
