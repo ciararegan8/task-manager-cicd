@@ -1,0 +1,205 @@
+
+name: GitHub Projects Automation
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  move-issue-to-done:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Check if PR is merged and move issue to Done
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+          PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+          PROJECT_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$GH_TOKEN" ] || [ -z "$PROJECT_NUMBER" ]; then
+            echo "Missing PROJECTS_TOKEN secret or PROJECT_NUMBER variable."
+            exit 1
+          fi
+
+          API_URL="https://api.github.com/graphql"
+
+          # Get project ID, Status field ID and Done option ID
+          PROJECT_QUERY='query($owner: String!, $number: Int!) {
+            user(login: $owner) {
+              projectV2(number: $number) {
+                id
+                fields(first: 100) {
+                  nodes {
+                    ... on ProjectV2SingleSelectField {
+                      id
+                      name
+                      options {
+                        id
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }'
+
+          PROJECT_RESPONSE=$(curl -sS --fail-with-body -X POST "$API_URL" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -n --arg query "$PROJECT_QUERY" \
+              --arg owner "$PROJECT_OWNER" \
+              --argjson number "$PROJECT_NUMBER" \
+              '{query:$query,variables:{owner:$owner,number:$number}}')")
+
+          PROJECT_ID=$(echo "$PROJECT_RESPONSE" | jq -r '.data.user.projectV2.id // empty')
+
+          STATUS_FIELD_ID=$(echo "$PROJECT_RESPONSE" | jq -r \
+            '.data.user.projectV2.fields.nodes[]? | select(.name == "Status") | .id')
+
+          DONE_OPTION_ID=$(echo "$PROJECT_RESPONSE" | jq -r \
+            '.data.user.projectV2.fields.nodes[]? | select(.name == "Status") | .options[]? | select(.name == "Done") | .id')
+
+          if [ -z "$PROJECT_ID" ] || [ -z "$STATUS_FIELD_ID" ] || [ -z "$DONE_OPTION_ID" ]; then
+            echo "Could not find the project, Status field or Done option."
+            exit 1
+          fi
+
+          # Find issues linked to the merged pull request
+          ISSUE_QUERY='query($owner: String!, $repo: String!, $pr: Int!) {
+            repository(owner: $owner, name: $repo) {
+              pullRequest(number: $pr) {
+                closingIssuesReferences(first: 100) {
+                  nodes {
+                    id
+                    number
+                  }
+                }
+              }
+            }
+          }'
+
+          ISSUE_RESPONSE=$(curl -sS --fail-with-body -X POST "$API_URL" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -n --arg query "$ISSUE_QUERY" \
+              --arg owner "$PROJECT_OWNER" \
+              --arg repo "$REPO_NAME" \
+              --argjson pr "$PR_NUMBER" \
+              '{query:$query,variables:{owner:$owner,repo:$repo,pr:$pr}}')")
+
+          ISSUES=$(echo "$ISSUE_RESPONSE" | jq -c \
+            '.data.repository.pullRequest.closingIssuesReferences.nodes // []')
+
+          if [ "$(echo "$ISSUES" | jq 'length')" -eq 0 ]; then
+            echo "No linked closing issues found."
+            exit 0
+          fi
+
+          # Process each linked issue
+          while IFS= read -r ISSUE; do
+            ISSUE_ID=$(echo "$ISSUE" | jq -r '.id')
+            ISSUE_NUMBER=$(echo "$ISSUE" | jq -r '.number')
+
+            echo "Updating issue #$ISSUE_NUMBER"
+
+            # Check whether the issue is already in the project
+            ITEMS_QUERY='query($projectId: ID!) {
+              node(id: $projectId) {
+                ... on ProjectV2 {
+                  items(first: 100) {
+                    nodes {
+                      id
+                      content {
+                        ... on Issue {
+                          id
+                          number
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }'
+
+            ITEMS_RESPONSE=$(curl -sS --fail-with-body -X POST "$API_URL" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "$(jq -n --arg query "$ITEMS_QUERY" \
+                --arg project "$PROJECT_ID" \
+                '{query:$query,variables:{projectId:$project}}')")
+
+            ITEM_ID=$(echo "$ITEMS_RESPONSE" | jq -r \
+              --arg issue "$ISSUE_ID" \
+              '.data.node.items.nodes[]? | select(.content.id == $issue) | .id' | head -n 1)
+
+            # Add the issue if it is not already in the project
+            if [ -z "$ITEM_ID" ]; then
+              ADD_QUERY='mutation($project: ID!, $content: ID!) {
+                addProjectV2ItemById(input: {
+                  projectId: $project
+                  contentId: $content
+                }) {
+                  item {
+                    id
+                  }
+                }
+              }'
+
+              ADD_RESPONSE=$(curl -sS --fail-with-body -X POST "$API_URL" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data "$(jq -n --arg query "$ADD_QUERY" \
+                  --arg project "$PROJECT_ID" \
+                  --arg content "$ISSUE_ID" \
+                  '{query:$query,variables:{project:$project,content:$content}}')")
+
+              ITEM_ID=$(echo "$ADD_RESPONSE" | jq -r \
+                '.data.addProjectV2ItemById.item.id // empty')
+            fi
+
+            if [ -z "$ITEM_ID" ]; then
+              echo "Could not find or add issue #$ISSUE_NUMBER."
+              exit 1
+            fi
+
+            # Change the issue status to Done
+            UPDATE_QUERY='mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $project
+                itemId: $item
+                fieldId: $field
+                value: {
+                  singleSelectOptionId: $option
+                }
+              }) {
+                projectV2Item {
+                  id
+                }
+              }
+            }'
+
+            UPDATE_RESPONSE=$(curl -sS --fail-with-body -X POST "$API_URL" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "$(jq -n --arg query "$UPDATE_QUERY" \
+                --arg project "$PROJECT_ID" \
+                --arg item "$ITEM_ID" \
+                --arg field "$STATUS_FIELD_ID" \
+                --arg option "$DONE_OPTION_ID" \
+                '{query:$query,variables:{project:$project,item:$item,field:$field,option:$option}}')")
+
+            echo "$UPDATE_RESPONSE" | jq -e \
+              '.data.updateProjectV2ItemFieldValue.projectV2Item.id' > /dev/null
+
+            echo "Issue #$ISSUE_NUMBER moved to Done."
+
+          done < <(echo "$ISSUES" | jq -c '.[]')
